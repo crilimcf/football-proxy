@@ -1,43 +1,36 @@
-from fastapi import FastAPI, Request, HTTPException
-import httpx, os, logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+import httpx
 
-app = FastAPI(title="Football Proxy API", version="1.0")
+app = FastAPI()
 
-# Variáveis de ambiente
-API_KEY = os.getenv("APIFOOTBALL_KEY", "30e1e48fbc6d0839f42212185149c7b4")
-PROXY_TOKEN = os.getenv("PROXY_TOKEN", "CF_Proxy_2025_Secret_!@#839")
-BASE_URL = "https://v3.football.api-sports.io"
+PROXY_TOKEN = "CF_Proxy_2025_Secret_!@#839"
 
-# Logging elegante
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# --- rota temporária para descobrir o IP público ---
+@app.get("/myip")
+async def get_my_ip(request: Request):
+    return {"ip": request.client.host}
+# ----------------------------------------------------
 
-@app.get("/{endpoint}")
-async def proxy(endpoint: str, request: Request):
-    """Proxy seguro para API-Football"""
+@app.middleware("http")
+async def check_token(request: Request, call_next):
+    # permite acesso livre apenas ao /myip
+    if request.url.path == "/myip":
+        return await call_next(request)
+
     token = request.headers.get("x-proxy-token")
     if token != PROXY_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido ou ausente")
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Token inválido ou ausente"},
+        )
+    return await call_next(request)
 
-    params = dict(request.query_params)
-    url = f"{BASE_URL}/{endpoint}"
-
-    headers = {"x-apisports-key": API_KEY}
-
-    logging.info(f"➡️ Proxying: {url} | params={params}")
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(url, headers=headers, params=params)
-
-    if response.status_code != 200:
-        logging.warning(f"⚠️ API-Football respondeu com {response.status_code}")
-        return {
-            "error": response.status_code,
-            "details": response.text,
-            "url": url,
-            "params": params
-        }
-
-    return response.json()
+@app.get("/status")
+async def get_status():
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            "https://v3.football.api-sports.io/status",
+            headers={"x-apisports-key": "30e1e48fbc6d0839f42212185149c7b4"},
+        )
+        return r.json()
