@@ -29,74 +29,25 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-app = FastAPI(title="Football Proxy API", version="2.1")
+app = FastAPI(title="Football Proxy API", version="2.2")
 
 # ===========================================
-# 🌍 CORS (acesso liberado)
+# 🌍 CORS
 # ===========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",  # ou restringe para ["https://previsao-futebol.vercel.app"]
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===========================================
-# 🩺 Health-check
-# ===========================================
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-# ===========================================
-# 🌐 Mostrar IP público do Render
-# ===========================================
-@app.get("/ip")
-async def get_public_ip():
-    """
-    Retorna o IP público do Render (para whitelist na API-Football)
-    """
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            ip = (await client.get("https://api.ipify.org")).text
-        return {
-            "ip_publico": ip.strip(),
-            "message": "Adiciona este IP na whitelist da API-Football",
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        }
-    except Exception as e:
-        logging.error(f"Erro ao obter IP público: {e}")
-        return {"erro": str(e)}
-
-# ===========================================
-# 🏠 Rota principal
-# ===========================================
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "football-proxy",
-        "version": "2.1",
-        "target": TARGET_BASE,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "docs": "/docs",
-        "ip_check": "/ip"
-    }
-
-# ===========================================
-# 🚦 Rota genérica de proxy
+# 🚦 Proxy genérico
 # ===========================================
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy_request(path: str, request: Request):
-    # Ignorar endpoints locais
-    if path in ["", "healthz", "ip"]:
-        return Response("Local route, not proxied.", status_code=400)
-
     if not API_KEY:
-        logging.error("❌ API_FOOTBALL_KEY não definida nas variáveis de ambiente.")
         return Response("❌ API_FOOTBALL_KEY não definida", status_code=500)
 
     url = f"{TARGET_BASE.rstrip('/')}/{path.lstrip('/')}"
@@ -105,7 +56,7 @@ async def proxy_request(path: str, request: Request):
     headers["x-apisports-key"] = API_KEY
     headers.pop("host", None)
 
-    logging.info(f"➡️ Proxying: {url} | Params: {params}")
+    logging.info(f"➡️ Proxying: {url}?{request.query_params}")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -118,11 +69,8 @@ async def proxy_request(path: str, request: Request):
                 return Response("❌ Método não suportado", status_code=405)
 
         logging.info(f"✅ [{resp.status_code}] {url}")
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "application/json")
-        )
+        return Response(content=resp.content, status_code=resp.status_code,
+                        media_type=resp.headers.get("content-type"))
 
     except httpx.TimeoutException:
         logging.error("⏳ Timeout ao contactar API-Football.")
@@ -130,6 +78,75 @@ async def proxy_request(path: str, request: Request):
     except Exception as e:
         logging.error(f"❌ Erro inesperado no proxy: {e}")
         return Response(f"Proxy error: {e}", status_code=500)
+
+# ===========================================
+# 🧠 Health e info
+# ===========================================
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "football-proxy",
+        "version": "2.2",
+        "target": TARGET_BASE,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "docs": "/docs",
+        "ip_check": "/ip",
+        "ip_test": "/ip/test"
+    }
+
+# ===========================================
+# 🌍 Endpoint para obter IP público
+# ===========================================
+@app.get("/ip")
+async def get_public_ip():
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            ip = (await client.get("https://api.ipify.org")).text
+        return {
+            "ip_publico": ip,
+            "message": "Adiciona este IP na whitelist da API-Football",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+    except Exception as e:
+        return {"error": f"Não foi possível obter IP público: {e}"}
+
+# ===========================================
+# 🧩 Teste de IP autorizado
+# ===========================================
+@app.get("/ip/test")
+async def test_ip_authorization():
+    if not API_KEY:
+        return {"status": "error", "message": "API_FOOTBALL_KEY não definida"}
+
+    url = f"{TARGET_BASE.rstrip('/')}/status"
+    headers = {"x-apisports-key": API_KEY}
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=headers)
+
+        data = resp.json()
+        if "errors" in data and data["errors"]:
+            return {
+                "status": "blocked",
+                "message": "❌ IP bloqueado — não está na whitelist da API-Football",
+                "details": data["errors"]
+            }
+
+        return {
+            "status": "ok",
+            "message": "✅ IP autorizado na API-Football",
+            "response": data.get("response", {}),
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": f"Erro ao testar acesso: {e}"}
 
 # ===========================================
 # 🚀 Execução local
