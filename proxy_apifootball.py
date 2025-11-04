@@ -1,108 +1,139 @@
-# ==========================================================
-# proxy_apifootball.py
-# API Football Proxy - by Carlos Fernandes
-# ==========================================================
-
 import os
 import logging
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Request, HTTPException
+import socket
 import httpx
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
 
-# ----------------------------------------------------------
-# CONFIGURAÇÃO
-# ----------------------------------------------------------
-API_KEY = os.getenv("APISPORTS_KEY", "30e1e48fbc6d0839f42212185149c7b4")
-BASE_URL = "https://v3.football.api-sports.io"
+# ===========================================
+# ✅ Forçar IPv4
+# ===========================================
+orig_getaddrinfo = socket.getaddrinfo
+def force_ipv4(*args, **kwargs):
+    return [info for info in orig_getaddrinfo(*args, **kwargs) if info[0] == socket.AF_INET]
+socket.getaddrinfo = force_ipv4
 
-# Token interno para proteção do proxy (não do API-Football)
-PROXY_TOKEN = os.getenv("PROXY_TOKEN", "CF_Proxy_2025_Secret_!@#839")
+# ===========================================
+# 🔧 Configurações
+# ===========================================
+API_KEY = os.getenv("API_FOOTBALL_KEY")
+TARGET_BASE = "https://v3.football.api-sports.io"
+PORT = int(os.getenv("PORT", 10000))
 
-# ----------------------------------------------------------
-# LOGGING
-# ----------------------------------------------------------
+# ===========================================
+# 🧱 Logging
+# ===========================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("proxy")
 
-# ----------------------------------------------------------
-# APP
-# ----------------------------------------------------------
-app = FastAPI(title="Football Proxy API", version="1.0")
+app = FastAPI(title="Football Proxy API", version="2.1")
 
-# ----------------------------------------------------------
-# UTIL
-# ----------------------------------------------------------
-async def fetch_api(endpoint: str, params: dict = None):
-    headers = {"x-apisports-key": API_KEY}
-    url = f"{BASE_URL}/{endpoint}"
+# ===========================================
+# 🌍 CORS (acesso liberado)
+# ===========================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*",  # ou restringe para ["https://previsao-futebol.vercel.app"]
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(url, headers=headers, params=params)
+# ===========================================
+# 🩺 Health-check
+# ===========================================
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-    if response.status_code != 200:
-        log.warning(f"⚠️ API-Football respondeu com {response.status_code}: {response.text}")
-        raise HTTPException(status_code=response.status_code, detail=response.text)
+# ===========================================
+# 🌐 Mostrar IP público do Render
+# ===========================================
+@app.get("/ip")
+async def get_public_ip():
+    """
+    Retorna o IP público do Render (para whitelist na API-Football)
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            ip = (await client.get("https://api.ipify.org")).text
+        return {
+            "ip_publico": ip.strip(),
+            "message": "Adiciona este IP na whitelist da API-Football",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+    except Exception as e:
+        logging.error(f"Erro ao obter IP público: {e}")
+        return {"erro": str(e)}
 
-    return response.json()
-
-# ----------------------------------------------------------
-# ENDPOINTS
-# ----------------------------------------------------------
-
+# ===========================================
+# 🏠 Rota principal
+# ===========================================
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Football Proxy ativo 🚀"}
+    return {
+        "status": "online",
+        "service": "football-proxy",
+        "version": "2.1",
+        "target": TARGET_BASE,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "docs": "/docs",
+        "ip_check": "/ip"
+    }
 
+# ===========================================
+# 🚦 Rota genérica de proxy
+# ===========================================
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def proxy_request(path: str, request: Request):
+    # Ignorar endpoints locais
+    if path in ["", "healthz", "ip"]:
+        return Response("Local route, not proxied.", status_code=400)
 
-@app.get("/status")
-async def get_status(request: Request):
-    token = request.headers.get("x-proxy-token")
-    if token != PROXY_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido ou ausente")
+    if not API_KEY:
+        logging.error("❌ API_FOOTBALL_KEY não definida nas variáveis de ambiente.")
+        return Response("❌ API_FOOTBALL_KEY não definida", status_code=500)
 
-    log.info("🔍 Verificando estado da API...")
-    return await fetch_api("status")
+    url = f"{TARGET_BASE.rstrip('/')}/{path.lstrip('/')}"
+    params = dict(request.query_params)
+    headers = dict(request.headers)
+    headers["x-apisports-key"] = API_KEY
+    headers.pop("host", None)
 
+    logging.info(f"➡️ Proxying: {url} | Params: {params}")
 
-@app.get("/fixtures")
-async def get_fixtures(request: Request, league: int = None, next: int = None, date: str = None):
-    token = request.headers.get("x-proxy-token")
-    if token != PROXY_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido ou ausente")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            if request.method == "GET":
+                resp = await client.get(url, headers=headers, params=params)
+            elif request.method == "POST":
+                data = await request.body()
+                resp = await client.post(url, headers=headers, content=data)
+            else:
+                return Response("❌ Método não suportado", status_code=405)
 
-    params = {}
-    if league:
-        params["league"] = league
-    if next:
-        params["next"] = next
-    if date:
-        params["date"] = date
+        logging.info(f"✅ [{resp.status_code}] {url}")
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json")
+        )
 
-    log.info(f"📅 Fetching fixtures | params={params}")
-    return await fetch_api("fixtures", params)
+    except httpx.TimeoutException:
+        logging.error("⏳ Timeout ao contactar API-Football.")
+        return Response("Timeout contacting API-Football", status_code=504)
+    except Exception as e:
+        logging.error(f"❌ Erro inesperado no proxy: {e}")
+        return Response(f"Proxy error: {e}", status_code=500)
 
-
-@app.get("/fixtures/next3days")
-async def fixtures_next3days(request: Request):
-    token = request.headers.get("x-proxy-token")
-    if token != PROXY_TOKEN:
-        raise HTTPException(status_code=401, detail="Token inválido ou ausente")
-
-    results = []
-    for i in range(3):
-        day = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
-        log.info(f"📆 Buscando jogos de {day}")
-        day_data = await fetch_api("fixtures", {"date": day})
-        results.append({"date": day, "fixtures": day_data.get("response", [])})
-    return {"days": results}
-
-
-@app.get("/myip")
-async def myip(request: Request):
-    client_ip = request.client.host
-    return {"ip": client_ip}
-
+# ===========================================
+# 🚀 Execução local
+# ===========================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("proxy_apifootball:app", host="0.0.0.0", port=PORT)
