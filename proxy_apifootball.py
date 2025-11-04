@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
 # ===========================================
-# ✅ Forçar IPv4
+# ✅ Forçar IPv4 (evita timeouts em Render)
 # ===========================================
 orig_getaddrinfo = socket.getaddrinfo
 def force_ipv4(*args, **kwargs):
@@ -36,44 +36,32 @@ app = FastAPI(title="Football Proxy API", version="2.2")
 # ===========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # podes restringir a origem se quiseres
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===========================================
-# 🧠 Health-check + IP público
+# 🌐 Endpoint para ver IP público (usado no UptimeRobot e whitelist)
 # ===========================================
-@app.get("/ip/test")
+@app.api_route("/ip", methods=["GET", "HEAD"])
 async def get_public_ip():
-    """Retorna o IP público atual do Render (para whitelisting na API-Football)."""
+    """
+    Retorna o IP público do servidor (para whitelist da API-Football)
+    Suporta GET e HEAD (para compatibilidade com UptimeRobot)
+    """
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            ip = (await client.get("https://api.ipify.org")).text
+        async with httpx.AsyncClient() as client:
+            ip_publico = (await client.get("https://api.ipify.org")).text.strip()
         return {
-            "ip_publico": ip,
+            "ip_publico": ip_publico,
             "message": "Adiciona este IP na whitelist da API-Football",
             "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         }
     except Exception as e:
-        return {"error": f"Falha ao obter IP: {str(e)}"}
-
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "football-proxy",
-        "version": "2.2",
-        "target": TARGET_BASE,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "docs": "/docs",
-        "ip_check": "/ip/test"
-    }
+        logging.error(f"Erro ao obter IP público: {e}")
+        return {"erro": str(e)}
 
 # ===========================================
 # 🚦 Rota genérica de proxy
@@ -86,7 +74,7 @@ async def proxy_request(path: str, request: Request):
     url = f"{TARGET_BASE.rstrip('/')}/{path.lstrip('/')}"
     params = dict(request.query_params)
     headers = dict(request.headers)
-    headers["x-apisports-key"] = API_KEY
+    headers["x-apisports-key"] = API_KEY  # substitui sempre por tua chave
     headers.pop("host", None)
 
     logging.info(f"➡️ Proxying: {url}?{request.query_params}")
@@ -101,6 +89,7 @@ async def proxy_request(path: str, request: Request):
             else:
                 return Response("❌ Método não suportado", status_code=405)
 
+        # logging resumo
         logging.info(f"✅ [{resp.status_code}] {url}")
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
@@ -112,13 +101,27 @@ async def proxy_request(path: str, request: Request):
         return Response(f"Proxy error: {e}", status_code=500)
 
 # ===========================================
+# 🧠 Health-check e info endpoint
+# ===========================================
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "football-proxy",
+        "version": "2.2",
+        "target": TARGET_BASE,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "docs": "/docs",
+        "ip_check": "/ip"
+    }
+
+# ===========================================
 # 🚀 Execução local
 # ===========================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "proxy_apifootball:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        log_level="info"
-    )
+    uvicorn.run("proxy_apifootball:app", host="0.0.0.0", port=PORT)
