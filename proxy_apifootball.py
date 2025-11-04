@@ -32,7 +32,7 @@ logging.basicConfig(
 app = FastAPI(title="Football Proxy API", version="2.2")
 
 # ===========================================
-# 🌍 CORS
+# 🌍 CORS (permite acesso do frontend e backend)
 # ===========================================
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +43,40 @@ app.add_middleware(
 )
 
 # ===========================================
-# 🚦 Proxy genérico
+# 🧠 Health-check + IP público
+# ===========================================
+@app.get("/ip/test")
+async def get_public_ip():
+    """Retorna o IP público atual do Render (para whitelisting na API-Football)."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            ip = (await client.get("https://api.ipify.org")).text
+        return {
+            "ip_publico": ip,
+            "message": "Adiciona este IP na whitelist da API-Football",
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        }
+    except Exception as e:
+        return {"error": f"Falha ao obter IP: {str(e)}"}
+
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "football-proxy",
+        "version": "2.2",
+        "target": TARGET_BASE,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "docs": "/docs",
+        "ip_check": "/ip/test"
+    }
+
+# ===========================================
+# 🚦 Rota genérica de proxy
 # ===========================================
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy_request(path: str, request: Request):
@@ -69,8 +102,7 @@ async def proxy_request(path: str, request: Request):
                 return Response("❌ Método não suportado", status_code=405)
 
         logging.info(f"✅ [{resp.status_code}] {url}")
-        return Response(content=resp.content, status_code=resp.status_code,
-                        media_type=resp.headers.get("content-type"))
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
     except httpx.TimeoutException:
         logging.error("⏳ Timeout ao contactar API-Football.")
@@ -80,77 +112,13 @@ async def proxy_request(path: str, request: Request):
         return Response(f"Proxy error: {e}", status_code=500)
 
 # ===========================================
-# 🧠 Health e info
-# ===========================================
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "football-proxy",
-        "version": "2.2",
-        "target": TARGET_BASE,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "docs": "/docs",
-        "ip_check": "/ip",
-        "ip_test": "/ip/test"
-    }
-
-# ===========================================
-# 🌍 Endpoint para obter IP público
-# ===========================================
-@app.get("/ip")
-async def get_public_ip():
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            ip = (await client.get("https://api.ipify.org")).text
-        return {
-            "ip_publico": ip,
-            "message": "Adiciona este IP na whitelist da API-Football",
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        }
-    except Exception as e:
-        return {"error": f"Não foi possível obter IP público: {e}"}
-
-# ===========================================
-# 🧩 Teste de IP autorizado
-# ===========================================
-@app.get("/ip/test")
-async def test_ip_authorization():
-    if not API_KEY:
-        return {"status": "error", "message": "API_FOOTBALL_KEY não definida"}
-
-    url = f"{TARGET_BASE.rstrip('/')}/status"
-    headers = {"x-apisports-key": API_KEY}
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers=headers)
-
-        data = resp.json()
-        if "errors" in data and data["errors"]:
-            return {
-                "status": "blocked",
-                "message": "❌ IP bloqueado — não está na whitelist da API-Football",
-                "details": data["errors"]
-            }
-
-        return {
-            "status": "ok",
-            "message": "✅ IP autorizado na API-Football",
-            "response": data.get("response", {}),
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        }
-
-    except Exception as e:
-        return {"status": "error", "message": f"Erro ao testar acesso: {e}"}
-
-# ===========================================
 # 🚀 Execução local
 # ===========================================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("proxy_apifootball:app", host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        "proxy_apifootball:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 10000)),
+        log_level="info"
+    )
