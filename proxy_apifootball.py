@@ -1,10 +1,11 @@
 import os
+import json
 import logging
 import socket
 import httpx
-from fastapi import FastAPI, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+from fastapi import FastAPI, Request, Response, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 # ===========================================
 # ✅ Forçar IPv4 (evita timeouts em Render)
@@ -20,6 +21,7 @@ socket.getaddrinfo = force_ipv4
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 TARGET_BASE = "https://v3.football.api-sports.io"
 PORT = int(os.getenv("PORT", 10000))
+CONFIG_DIR = os.environ.get("CONFIG_DIR", "config")
 
 # ===========================================
 # 🧱 Logging
@@ -29,28 +31,69 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-app = FastAPI(title="Football Proxy API", version="2.2")
+app = FastAPI(title="Football Proxy API", version="2.3")
 
 # ===========================================
 # 🌍 CORS (permite acesso do frontend e backend)
 # ===========================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # podes restringir a origem se quiseres
+    allow_origins=["*"],  # restringe se quiseres
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===========================================
-# 🌐 Endpoint para ver IP público (usado no UptimeRobot e whitelist)
+# 🔎 Utilitários locais
+# ===========================================
+def _read_json(path: str):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def _load_leagues_for(season: str):
+    # validação simples da época
+    if not (isinstance(season, str) and season.isdigit() and len(season) == 4):
+        raise HTTPException(status_code=400, detail="Parâmetro 'season' inválido. Use YYYY (ex.: 2024).")
+
+    path_season = os.path.join(CONFIG_DIR, f"leagues_{season}.json")
+    items = _read_json(path_season)
+
+    # fallback para snapshot mais recente
+    if not items:
+        items = _read_json(os.path.join(CONFIG_DIR, "leagues.json"))
+
+    if not items:
+        raise HTTPException(status_code=404, detail=f"Nenhuma lista de ligas encontrada (season={season}).")
+
+    # normalização + ordenação estável
+    out = []
+    for x in items:
+        try:
+            out.append({
+                "id": int(x["id"]),
+                "name": x.get("name"),
+                "country": x.get("country"),
+                "type": x.get("type"),
+            })
+        except Exception:
+            pass
+
+    # rename amigável (Saudi vem como "Pro League")
+    for x in out:
+        if (x.get("country") in ("Saudi-Arabia", "Saudi Arabia")) and x.get("name") == "Pro League":
+            x["name"] = "Saudi Pro League"
+
+    out.sort(key=lambda y: ((y.get("country") or ""), (y.get("type") or ""), (y.get("name") or "")))
+    return out
+
+# ===========================================
+# 🌐 Endpoint para ver IP público (whitelist)
 # ===========================================
 @app.api_route("/ip", methods=["GET", "HEAD"])
 async def get_public_ip():
-    """
-    Retorna o IP público do servidor (para whitelist da API-Football)
-    Suporta GET e HEAD (para compatibilidade com UptimeRobot)
-    """
     try:
         async with httpx.AsyncClient() as client:
             ip_publico = (await client.get("https://api.ipify.org")).text.strip()
@@ -64,7 +107,35 @@ async def get_public_ip():
         return {"erro": str(e)}
 
 # ===========================================
-# 🚦 Rota genérica de proxy
+# 📚 Leagues (curadas a partir de config/)
+# ===========================================
+@app.get("/leagues")
+@app.get("/meta/leagues")  # alias retro-compatível
+def get_leagues(season: str = Query("2024", regex=r"^\d{4}$")):
+    return _load_leagues_for(season)
+
+# ===========================================
+# 🧠 Health-check e info
+# ===========================================
+@app.get("/healthz")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "football-proxy",
+        "version": "2.3",
+        "target": TARGET_BASE,
+        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "docs": "/docs",
+        "ip_check": "/ip",
+        "leagues": "/leagues?season=2024"
+    }
+
+# ===========================================
+# 🚦 Rota genérica de proxy (deixa NO FIM)
 # ===========================================
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def proxy_request(path: str, request: Request):
@@ -89,7 +160,6 @@ async def proxy_request(path: str, request: Request):
             else:
                 return Response("❌ Método não suportado", status_code=405)
 
-        # logging resumo
         logging.info(f"✅ [{resp.status_code}] {url}")
         return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get("content-type"))
 
@@ -99,25 +169,6 @@ async def proxy_request(path: str, request: Request):
     except Exception as e:
         logging.error(f"❌ Erro inesperado no proxy: {e}")
         return Response(f"Proxy error: {e}", status_code=500)
-
-# ===========================================
-# 🧠 Health-check e info endpoint
-# ===========================================
-@app.get("/healthz")
-async def health_check():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "service": "football-proxy",
-        "version": "2.2",
-        "target": TARGET_BASE,
-        "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "docs": "/docs",
-        "ip_check": "/ip"
-    }
 
 # ===========================================
 # 🚀 Execução local
